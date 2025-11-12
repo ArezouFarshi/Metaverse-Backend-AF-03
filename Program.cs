@@ -13,12 +13,11 @@ using Nethereum.Contracts;
 using Nethereum.Hex.HexTypes;
 using Nethereum.RPC.Eth.DTOs;
 
-// Bind to Render port
+// ----- Build Web App -----
 var builder = WebApplication.CreateBuilder(args);
 var port = Environment.GetEnvironmentVariable("PORT") ?? "10000";
 builder.WebHost.UseUrls($"http://0.0.0.0:{port}");
 
-// CORS for Spatial/web builds
 builder.Services.AddCors(o => o.AddDefaultPolicy(p => p
     .AllowAnyOrigin()
     .AllowAnyHeader()
@@ -31,18 +30,19 @@ var app = builder.Build();
 app.UseCors();
 app.UseWebSockets();
 
-// Shared state
+// ----- Shared State -----
 var clients = new ConcurrentDictionary<Guid, WebSocket>();
-var panelStates = new ConcurrentDictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+var panelStates = new ConcurrentDictionary<string, object>(StringComparer.OrdinalIgnoreCase);
 
-// HTTP endpoints
-app.MapGet("/", () => Results.Text("👋 Metaverse Backend is running!"));
-app.MapGet("/api/visibility", (HttpContext ctx) => {
+// ----- HTTP Endpoints -----
+app.MapGet("/", () => Results.Text("✅ Metaverse Backend is running!"));
+app.MapGet("/api/visibility", (HttpContext ctx) =>
+{
     ctx.Response.Headers.CacheControl = "no-store";
     return Results.Json(panelStates);
 });
 
-// WebSocket endpoint
+// ----- WebSocket Endpoint -----
 app.Map("/ws", async context =>
 {
     if (!context.WebSockets.IsWebSocketRequest) { context.Response.StatusCode = 400; return; }
@@ -50,25 +50,28 @@ app.Map("/ws", async context =>
     var id = Guid.NewGuid();
     clients[id] = socket;
 
-    try {
+    try
+    {
         var buffer = new byte[1024];
-        while (socket.State == WebSocketState.Open) {
+        while (socket.State == WebSocketState.Open)
+        {
             var result = await socket.ReceiveAsync(new ArraySegment<byte>(buffer), context.RequestAborted);
             if (result.MessageType == WebSocketMessageType.Close) break;
         }
     }
-    finally {
+    finally
+    {
         clients.TryRemove(id, out _);
         if (socket.State != WebSocketState.Closed)
             await socket.CloseAsync(WebSocketCloseStatus.NormalClosure, "Closed", context.RequestAborted);
     }
 });
 
-// ----- Blockchain listener in background -----
+// ----- Blockchain Listener -----
 var infuraUrl = Environment.GetEnvironmentVariable("INFURA_URL")
-    ?? "https://sepolia.infura.io/v3/51bc36040f314e85bf103ff18c570993";
+    ?? "https://sepolia.infura.io/v3/6ad85a144d0445a3b181add73f6a55d9";
 var contractAddress = Environment.GetEnvironmentVariable("CONTRACT_ADDRESS")
-    ?? "0x59B649856d8c5Fb6991d30a345f0b923eA91a3f7";
+    ?? "0xF2dCCAddE9dEe3ffF26C98EC63e2c44E08B4C65c";
 var pollMs = int.TryParse(Environment.GetEnvironmentVariable("POLL_MS"), out var ms) ? ms : 10000;
 
 _ = Task.Run(async () =>
@@ -85,33 +88,42 @@ _ = Task.Run(async () =>
             if (current.Value > lastBlock.Value)
             {
                 var from = new BlockParameter(new HexBigInteger(lastBlock.Value + 1));
-                var to   = new BlockParameter(current);
+                var to = new BlockParameter(current);
                 var filter = handler.CreateFilterInput(from, to);
                 var logs = await handler.GetAllChangesAsync(filter);
 
                 foreach (var ch in logs)
                 {
                     var e = ch.Event;
-                    string hash = e.EventHash != null ? "0x" + BitConverter.ToString(e.EventHash).Replace("-", "").ToLower() : "0x";
+                    if (string.IsNullOrWhiteSpace(e.PanelId)) continue;
 
-                    if (!string.IsNullOrWhiteSpace(e.PanelId) && !string.IsNullOrWhiteSpace(e.EventType))
+                    // Update current panel state (ID_x_x_x dynamic)
+                    var panelInfo = new
                     {
-                        var status = MapEventTypeToStatus(e.EventType, e.FaultSeverity);
-                        panelStates[e.PanelId] = status;
-                    }
+                        color = e.Color ?? "blue",
+                        status = e.Status ?? "Unknown",
+                        ok = e.Ok,
+                        prediction = e.Prediction.ToString(),
+                        reason = e.Reason ?? "",
+                        timestamp = e.Timestamp.ToString()
+                    };
 
-                    var payload = JsonSerializer.Serialize(new {
+                    panelStates[e.PanelId] = panelInfo;
+
+                    // Broadcast full payload
+                    var payload = JsonSerializer.Serialize(new
+                    {
                         panelId = e.PanelId,
-                        eventType = e.EventType,
-                        faultType = e.FaultType,
-                        faultSeverity = e.FaultSeverity,
-                        actionTaken = e.ActionTaken,
-                        eventHash = hash,
-                        validatedBy = e.ValidatedBy,
+                        color = e.Color ?? "blue",
+                        status = e.Status ?? "Unknown",
+                        ok = e.Ok,
+                        prediction = e.Prediction.ToString(),
+                        reason = e.Reason ?? "",
                         timestamp = e.Timestamp.ToString()
                     });
 
                     await BroadcastAsync(payload, clients);
+                    app.Logger.LogInformation($"Event received for {e.PanelId}: {e.Color}/{e.Status}");
                 }
 
                 lastBlock = current;
@@ -128,7 +140,7 @@ _ = Task.Run(async () =>
 
 app.Run();
 
-// ---------- local helpers (ok with top-level) ----------
+// ----- Helper Methods -----
 static async Task BroadcastAsync(string message, ConcurrentDictionary<Guid, WebSocket> clients)
 {
     var bytes = Encoding.UTF8.GetBytes(message);
@@ -153,17 +165,4 @@ static async Task BroadcastAsync(string message, ConcurrentDictionary<Guid, WebS
             try { await ws.CloseAsync(WebSocketCloseStatus.NormalClosure, "Cleanup", CancellationToken.None); } catch { }
         }
     }
-}
-
-static string MapEventTypeToStatus(string? eventType, string? faultSeverity)
-{
-    if (string.IsNullOrWhiteSpace(eventType)) return "blue";
-    var t = eventType.Trim().ToLowerInvariant();
-
-    if (t is "installed" or "ok" or "resolved" or "maintenancecompleted") return "green";
-    if (t is "warning" or "degraded") return "yellow";
-    if (t is "fault" or "error" or "failed" or "critical") return "red";
-    if (t is "systemerror" or "oraclemismatch" or "invalidsignature") return "purple";
-    if (t is "notinstalled" or "pending") return "grey";
-    return "blue";
 }
